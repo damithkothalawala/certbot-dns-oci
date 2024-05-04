@@ -24,13 +24,22 @@ class Authenticator(dns_common.DNSAuthenticator):
         # self.credentials = None
 
     @classmethod
-    def add_parser_arguments(cls, add, **kwargs):  # pylint: disable=arguments-differ
+    def add_parser_arguments(cls, add):  # pylint: disable=arguments-differ
         super(Authenticator, cls).add_parser_arguments(
-            add, default_propagation_seconds=15
+            add, default_propagation_seconds=60
         )
         # TODO: implement these:
         add('config', help="OCI CLI Configuration file.")
         add('profile', help="OCI configuration profile (in OCI configuration file)")
+        # Add argument for instance principal
+        add('instance-principal',help="Use instance principal for authentication.")
+
+    def validate_options(self):
+        # Validate options to ensure that conflicting arguments are not provided together
+        if self.conf('instance-principal') and self.conf('config'):
+            raise errors.PluginError(
+                "Conflicting arguments: '--dns-oci-instance-principal' and '--dns-oci-config' cannot be provided together."
+            )
 
     def more_info(self):  # pylint: disable=missing-docstring,no-self-use
         return (
@@ -39,11 +48,17 @@ class Authenticator(dns_common.DNSAuthenticator):
         )
 
     def _setup_credentials(self):
-        # implement profile - full implementation of config file is WIP
-        oci_config_profile = 'DEFAULT'
-        if self.conf('profile') is not None:
-            oci_config_profile = self.conf('profile')
-        self.credentials = oci.config.from_file(profile_name=oci_config_profile)
+        # Validate options
+        self.validate_options()
+
+        if self.conf('instance-principal') is None:
+            self.credentials = oci.config.from_file()
+        
+            oci_config_profile = 'DEFAULT'
+            if self.conf('profile') is not None:
+                    oci_config_profile = self.conf('profile')
+                    self.credentials = oci.config.from_file(profile_name=oci_config_profile)
+
 
     def _perform(self, domain, validation_name, validation):
         self._get_ocidns_client().add_txt_record(
@@ -56,7 +71,10 @@ class Authenticator(dns_common.DNSAuthenticator):
         )
 
     def _get_ocidns_client(self):
-        return _OCIDNSClient(self.credentials)
+        if self.conf('instance-principal') is not None:
+            return _OCIDNSClient()
+        else:
+            return _OCIDNSClient(self.credentials)
 
 
 class _OCIDNSClient:
@@ -67,11 +85,17 @@ class _OCIDNSClient:
     In Other Words: thar be dragons
     """
 
-    def __init__(self, oci_config):
-        logger.debug("creating OCI DnsClient")
+    def __init__(self, oci):
+        logger.debug("creating OCI DnsClient Using Config File")
         # this is where you would add code to handle Resource, Instance, or non-default configs
         config = oci.config.from_file()
-        self.dns_client = oci.dns.DnsClient(oci_config)
+        self.dns_client = oci.dns.DnsClient(oci.ci_config)
+
+    def __init__(self):
+        logger.debug("creating OCI DnsClient Using Instance Principal")
+        # this is where you would add code to handle Resource, Instance, or non-default configs
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        self.dns_client = oci.dns.DnsClient(config={}, signer=signer)
 
     def add_txt_record(self, domain, record_name, record_content, record_ttl):
         """
@@ -89,7 +113,7 @@ class _OCIDNSClient:
         # first find the domain
         zone_ocid, zone_name = self._find_managed_zone(domain, record_name)
         if zone_name is None:
-            raise errors.PluginError("Domain not known")
+            raise errors.PluginError("Domain not known. Please Make sure the domain is in OCI DNS and You have the correct permissions.")
         logger.debug("Found domain %s with OCID %s", zone_name, zone_ocid)
 
         # NOTE: the OCI SDK will treat:
