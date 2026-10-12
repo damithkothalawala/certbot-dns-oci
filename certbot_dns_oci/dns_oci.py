@@ -1,179 +1,177 @@
-"""DNS Authenticator for OCI."""
-import logging
+"""DNS Authenticator for Oracle Cloud Infrastructure."""
 
-from certbot import errors
-from certbot import interfaces
-from certbot.plugins import dns_common
+import configparser
+import logging
+from typing import Any, Callable
 
 import oci
+from circuitbreaker import CircuitBreakerError
+from certbot import configuration, errors
+from certbot.compat import os
+from certbot.plugins import dns_common
 
 logger = logging.getLogger(__name__)
 
 
 class Authenticator(dns_common.DNSAuthenticator):
-    """DNS Authenticator for Oracle Cloud Infrastructure DNS service
-
-    This Authenticator uses the OCI REST API to fulfill a dns-01 challenge.
-    """
+    """Fulfil DNS-01 challenges using OCI public DNS."""
 
     description = "Obtain certificates using a DNS TXT record (if you are using OCI for DNS)."
     ttl = 60
 
-    def __init__(self, *args, **kwargs):
-        super(Authenticator, self).__init__(*args, **kwargs)
-        # self.credentials = None
+    def __init__(self, config: configuration.NamespaceConfig, name: str) -> None:
+        super().__init__(config, name)
+        self._client: _OCIDNSClient | None = None
 
     @classmethod
-    def add_parser_arguments(cls, add, **kwargs):  # pylint: disable=arguments-differ
-        super(Authenticator, cls).add_parser_arguments(
-            add, default_propagation_seconds=15
-        )
-        # TODO: implement these:
-        add('config', help="OCI CLI Configuration file.")
-        add('profile', help="OCI configuration profile (in OCI configuration file)")
+    def add_parser_arguments(cls, add: Callable[..., None], **kwargs: Any) -> None:
+        super().add_parser_arguments(add, default_propagation_seconds=15)
+        add("config", help="OCI SDK configuration file (default: OCI SDK search paths).")
+        add("profile", help="OCI configuration profile (default: DEFAULT).")
 
-    def more_info(self):  # pylint: disable=missing-docstring,no-self-use
-        return (
-            "This plugin configures a DNS TXT record to respond to a dns-01 challenge using "
-            + "the OCI REST API."
-        )
+    def more_info(self) -> str:
+        return "This plugin creates and removes DNS-01 TXT records using the OCI DNS API."
 
-    def _setup_credentials(self):
-        # There is no code here
-        return
+    def _setup_credentials(self) -> None:
+        self._get_ocidns_client()
 
-    def _perform(self, domain, validation_name, validation):
+    def _perform(self, domain: str, validation_name: str, validation: str) -> None:
         self._get_ocidns_client().add_txt_record(
             domain, validation_name, validation, self.ttl
         )
 
-    def _cleanup(self, domain, validation_name, validation):
-        self._get_ocidns_client().del_txt_record(
-            domain, validation_name, validation
+    def _cleanup(self, domain: str, validation_name: str, validation: str) -> None:
+        self._get_ocidns_client().del_txt_record(domain, validation_name, validation)
+
+    def _config_file_path(self) -> str:
+        """Resolve OCI's documented default search order without private SDK APIs."""
+        path = self.conf("config")
+        if not path:
+            path = oci.config.DEFAULT_LOCATION
+            if not os.path.isfile(os.path.expanduser(path)):
+                fallback = oci.config.FALLBACK_DEFAULT_LOCATION
+                if os.environ.get("OCI_CONFIG_FILE"):
+                    path = os.environ["OCI_CONFIG_FILE"]
+                elif os.path.isfile(os.path.expanduser(fallback)):
+                    path = fallback
+        return os.path.abspath(os.path.expanduser(path))
+
+    def _get_ocidns_client(self) -> "_OCIDNSClient":
+        if self._client is None:
+            config_path = self._config_file_path()
+            profile = self.conf("profile") or oci.config.DEFAULT_PROFILE
+            try:
+                dns_common.validate_file_permissions(config_path)
+                config = oci.config.from_file(file_location=config_path, profile_name=profile)
+                oci.config.validate_config(config)
+                self._client = _OCIDNSClient(config)
+            except (oci.exceptions.ClientError, OSError, ValueError, configparser.Error) as err:
+                raise errors.PluginError(
+                    f"Unable to load OCI credentials from {config_path!r} "
+                    f"(profile {profile!r}; {type(err).__name__}). "
+                    "Check the configuration, API signing key, and region."
+                ) from err
+
+            # Certbot persists plugin options for renewal. Store the resolved path
+            # so a different working directory or environment cannot change it.
+            setattr(self.config, self.dest("config"), config_path)
+            setattr(self.config, self.dest("profile"), profile)
+        return self._client
+
+
+class _ZoneNotFound(errors.PluginError):
+    """No accessible public zone was found for the challenge."""
+
+
+class _OCIDNSClient:
+    """Use value-specific PATCH operations without replacing other TXT records."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.dns_client = oci.dns.DnsClient(config)
+        self._zones: dict[str, tuple[str, str]] = {}
+
+    @staticmethod
+    def _api_error(action: str, err: oci.exceptions.ServiceError) -> errors.PluginError:
+        return errors.PluginError(
+            f"OCI DNS error while {action}: HTTP {err.status} ({err.code}). "
+            "Check the OCI credentials, region, and DNS permissions."
         )
 
-    def _get_ocidns_client(self):
-        return _OCIDNSClient()
+    def add_txt_record(
+        self, domain: str, record_name: str, record_content: str, record_ttl: int
+    ) -> None:
+        """Add only the challenge's TXT value to the public zone."""
+        zone_id, _ = self._find_managed_zone(domain, record_name)
+        record = oci.dns.models.RecordOperation(
+            operation="ADD", domain=record_name, rtype="TXT",
+            rdata=record_content, ttl=record_ttl,
+        )
+        try:
+            self.dns_client.patch_domain_records(
+                zone_id, record_name,
+                oci.dns.models.PatchDomainRecordsDetails(items=[record]),
+                scope="GLOBAL",
+            )
+        except oci.exceptions.ServiceError as err:
+            raise self._api_error(f"adding TXT record {record_name}", err) from err
+        except (
+            oci.exceptions.RequestException, oci.exceptions.ConnectTimeout, CircuitBreakerError
+        ) as err:
+            raise errors.PluginError(f"Unable to reach OCI DNS to add {record_name}.") from err
+        logger.debug("Added TXT record %s in zone %s", record_name, zone_id)
 
+    def del_txt_record(self, domain: str, record_name: str, record_content: str) -> None:
+        """Remove the challenge value, leaving other values and record types intact."""
+        try:
+            zone_id, _ = self._find_managed_zone(domain, record_name)
+        except _ZoneNotFound:
+            logger.warning("Cannot find an accessible public zone to clean up %s", record_name)
+            return
+        record = oci.dns.models.RecordOperation(
+            operation="REMOVE", domain=record_name, rtype="TXT", rdata=record_content,
+        )
+        try:
+            self.dns_client.patch_domain_records(
+                zone_id, record_name,
+                oci.dns.models.PatchDomainRecordsDetails(items=[record]),
+                scope="GLOBAL",
+            )
+        except oci.exceptions.ServiceError as err:
+            if err.status == 404:
+                # OCI also uses 404 for inaccessible resources; keep that visible.
+                logger.warning(
+                    "Record or zone missing or inaccessible during cleanup of %s", record_name
+                )
+                return
+            raise self._api_error(f"removing TXT record {record_name}", err) from err
+        except (
+            oci.exceptions.RequestException, oci.exceptions.ConnectTimeout, CircuitBreakerError
+        ) as err:
+            raise errors.PluginError(f"Unable to reach OCI DNS to remove {record_name}.") from err
+        logger.debug("Removed TXT record %s in zone %s", record_name, zone_id)
 
-class _OCIDNSClient(object):
-    """
-    This class handles calling OCI SDK / REST API needed for this use case.
-    This is a FAR from complete implementation of anything and is really
-    only intended for my own use.
-    In Other Words: thar be dragons
-    """
+    def _find_managed_zone(self, domain: str, record_name: str) -> tuple[str, str]:
+        """Find the most specific accessible public zone for the record."""
+        record_name = record_name.rstrip(".").lower()
+        if record_name in self._zones:
+            return self._zones[record_name]
 
-    def __init__(self):
-        logger.debug("creating OCI DnsClient")
-        # this is where you would add code to handle Resource, Instance, or non-default configs
-        config = oci.config.from_file()
-        self.dns_client = oci.dns.DnsClient(config)
-
-    def add_txt_record(self, domain, record_name, record_content, record_ttl):
-        """
-        Add a TXT record using the supplied information.
-
-        :param str domain: The domain to use to look up the OCI DNS zone.
-        :param str record_name: The record name (typically beginning with '_acme-challenge.').
-        :param str record_content: The record content (typically the challenge validation).
-        :param int record_ttl: The record TTL (number of seconds that the record may be cached).
-        :raises certbot.errors.PluginError: if an error occurs communicating with the OCI API
-        """
-
-        # check to see if the DNS zone is present in OCI
-
-        # first find the domain
-        zone_ocid, zone_name = self._find_managed_zone(domain, record_name)
-        if zone_name is None:
-            raise errors.PluginError("Domain not known")
-        logger.debug("Found domain %s with OCID %s", zone_name, zone_ocid)
-
-        # NOTE: the OCI SDK will treat:
-        #  - an addition of the same name + value + TTL as a NO OP
-        #  - an addition of the same name + value (but different TTL) as an update to the TTL
-        # it does NOT throw an error in either case.
-
-        logger.debug("Setting record %s in zone %s to value %s w/ TTL %d",
-                     record_name, zone_ocid, record_content, record_ttl)
-
-        result = self.dns_client.patch_domain_records(
-            zone_name,
-            record_name,
-            oci.dns.models.PatchDomainRecordsDetails( items=[ oci.dns.models.RecordOperation(
-                operation='ADD',
-                domain=record_name,
-                ttl=record_ttl,
-                rtype='TXT',
-                rdata=record_content) ] ) )
-
-        logger.debug("Update successful.")
-        logger.debug("New rrset version: %s", result.data.items[0].rrset_version)
-
-        logger.debug("Success")
-
-    # note: add_txt_record takes a 4th parameter for the ttl
-    #       but ALL records with the same name have the same TTL
-    #       so just in case anyone else changed the TTL on us unexpectedly
-    #       we just delete the record with the name, type (TXT), and value we created
-    def del_txt_record(self, domain, record_name, record_content):
-        """
-        Delete a TXT record using the supplied information.
-
-        :param str domain: The domain name
-        :param str record_name: The record name (typically beginning with '_acme-challenge.').
-        :param str record_content: The record content
-
-        :raises certbot.errors.PluginError: if the domain name is not known
-        """
-        # first find the domain
-        zone_ocid, zone_name = self._find_managed_zone(domain, record_name)
-        if zone_name is None:
-            raise errors.PluginError("Domain not known")
-        logger.debug("Found domain %s with OCID %s", zone_name, zone_ocid)
-
-        result = self.dns_client.patch_domain_records(
-            zone_name,
-            record_name,
-            oci.dns.models.PatchDomainRecordsDetails( items=[ oci.dns.models.RecordOperation(
-                operation='REMOVE',
-                domain=record_name,
-                rtype='TXT',
-                rdata=record_content
-            ) ] ) )
-
-        logger.debug("Success")
-
-    def _find_managed_zone(self, domain, record_name):
-        """
-        Find the managed zone for a given domain.
-
-        :param str domain: The domain for which to find the managed zone.
-        :returns: The ID of the managed zone, if found.
-        :rtype: str
-        :raises certbot.errors.PluginError: if the managed zone cannot be found.
-        """
-
-        zone_dns_name_guesses = [record_name] + dns_common.base_domain_name_guesses(domain)
-
-        logger.debug("Guesses: ")
-        for zone_name in zone_dns_name_guesses:
-            logger.debug(" - %s", zone_name)
-
-        for zone_name in zone_dns_name_guesses:
-            # get the zone id
+        for zone_name in dns_common.base_domain_name_guesses(record_name):
             try:
-                logger.debug("looking for zone: %s", zone_name)
-                try:
-                    response = self.dns_client.get_zone(zone_name)
-                    if response.status == 200:
-                        logger.debug("Response data %s", response.data)
-                        logger.debug("Found zone: %s", zone_name)
-                        logger.debug("OCID: %s", response.data.id)
-                        logger.debug("Compartment: %s", response.data.compartment_id)
-                        return response.data.id, zone_name
-                except oci.exceptions.ServiceError as e:
-                    logger.debug("Zone '%s' not found", zone_name)
-            except errors.PluginError as e:
-                pass
-        return None, None
+                response = self.dns_client.get_zone(zone_name, scope="GLOBAL")
+            except oci.exceptions.ServiceError as err:
+                if err.status == 404:
+                    continue
+                raise self._api_error(f"looking up zone {zone_name}", err) from err
+            except (
+                oci.exceptions.RequestException, oci.exceptions.ConnectTimeout, CircuitBreakerError
+            ) as err:
+                raise errors.PluginError(f"Unable to reach OCI DNS to look up {zone_name}.") from err
+            zone = (response.data.id, zone_name)
+            self._zones[record_name] = zone
+            return zone
+
+        raise _ZoneNotFound(
+            f"No accessible OCI public DNS zone found for {record_name} "
+            f"(certificate domain {domain}). Check the region and DNS permissions."
+        )
