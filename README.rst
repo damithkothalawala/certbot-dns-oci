@@ -28,7 +28,7 @@ The OCI CLI is optional; the plugin uses the OCI Python SDK directly.
 
 .. code-block:: bash
 
-    git clone https://github.com/damithkothalawala/certbot-dns-oci.git
+    git clone https://github.com/therealcmj/certbot-dns-oci.git
     cd certbot-dns-oci
     python3 -m venv .venv
     .venv/bin/python -m pip install --upgrade pip

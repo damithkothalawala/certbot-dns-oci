@@ -43,9 +43,9 @@ dependencies = [
 test = ["pytest>=8"]
 
 [project.urls]
-Homepage = "https://github.com/damithkothalawala/certbot-dns-oci"
-Repository = "https://github.com/damithkothalawala/certbot-dns-oci"
-Issues = "https://github.com/damithkothalawala/certbot-dns-oci/issues"
+Homepage = "https://github.com/therealcmj/certbot-dns-oci"
+Repository = "https://github.com/therealcmj/certbot-dns-oci"
+Issues = "https://github.com/therealcmj/certbot-dns-oci/issues"
 
 [project.entry-points."certbot.plugins"]
 dns-oci = "certbot_dns_oci.dns_oci:Authenticator"
